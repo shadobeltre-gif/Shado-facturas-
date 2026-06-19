@@ -1,0 +1,957 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>SHADO — Cheques & Facturas</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0f1117; font-family: 'Segoe UI', Arial, sans-serif; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  input:focus { outline: 2px solid #4f7cff; outline-offset: 1px; }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: #1a1d27; }
+  ::-webkit-scrollbar-thumb { background: #2e3352; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef } = React;
+
+const STEPS = ["Plantilla", "Documentos", "Revisión", "Exportar"];
+const C = {
+  bg:"#0f1117", surface:"#1a1d27", card:"#21253a", border:"#2e3352",
+  accent:"#4f7cff", success:"#22c55e", warning:"#f59e0b", danger:"#ef4444",
+  text:"#e8eaf6", muted:"#8b92b8", highlight:"#2a3060",
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function fileToBase64(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result.split(",")[1]);
+    r.onerror = () => rej(new Error("Error leyendo archivo"));
+    r.readAsDataURL(file);
+  });
+}
+
+function getMediaType(file) {
+  if (file.type === "application/pdf") return "application/pdf";
+  if (file.type.startsWith("image/")) return file.type;
+  return "image/jpeg";
+}
+
+// Calls our own Vercel serverless function — API key never exposed to browser
+async function callClaude(messages, systemPrompt) {
+  const res = await fetch("/api/claude", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 2000,
+      system: systemPrompt,
+      messages,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `Error ${res.status}`);
+  }
+  const data = await res.json();
+  return data.content.map(b => b.text || "").join("");
+}
+
+function parseJSON(raw) {
+  try { return JSON.parse(raw.replace(/```json|```/g, "").trim()); }
+  catch { return null; }
+}
+
+function fmt(n) { return (n || 0).toLocaleString("es-DO", { minimumFractionDigits: 2 }); }
+function parseMonto(s) { return parseFloat((s || "0").replace(/[^0-9.]/g, "")) || 0; }
+
+// ── Sub-components ────────────────────────────────────────────────────────────
+
+function UploadBox({ label, accept, file, onChange, icon, color }) {
+  const ref = useRef();
+  const [over, setOver] = useState(false);
+  const drop = e => { e.preventDefault(); setOver(false); if (e.dataTransfer.files[0]) onChange(e.dataTransfer.files[0]); };
+  return (
+    <div onClick={() => ref.current.click()}
+      onDragOver={e => { e.preventDefault(); setOver(true); }}
+      onDragLeave={() => setOver(false)} onDrop={drop}
+      style={{ border:`2px dashed ${over?color:file?C.success:C.border}`, borderRadius:12, padding:"24px 16px",
+        cursor:"pointer", background:over?`${color}18`:file?"#22c55e11":C.card, transition:"all .2s",
+        textAlign:"center", minHeight:110, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:8 }}>
+      <input ref={ref} type="file" accept={accept} style={{display:"none"}} onChange={e => e.target.files[0] && onChange(e.target.files[0])} />
+      <div style={{fontSize:28}}>{file ? "✅" : icon}</div>
+      <div style={{color:file?C.success:C.text, fontWeight:600, fontSize:13, wordBreak:"break-all"}}>{file ? file.name : label}</div>
+      <div style={{color:C.muted, fontSize:11}}>{file ? `${(file.size/1024).toFixed(0)} KB — clic para cambiar` : `Arrastra o clic · ${accept}`}</div>
+    </div>
+  );
+}
+
+function Spinner({ label }) {
+  return (
+    <div style={{textAlign:"center", padding:32}}>
+      <div style={{width:40,height:40,border:`3px solid ${C.border}`,borderTop:`3px solid ${C.accent}`,borderRadius:"50%",animation:"spin 1s linear infinite",margin:"0 auto 16px"}}/>
+      <div style={{color:C.muted, fontSize:13}}>{label}</div>
+    </div>
+  );
+}
+
+function StepBar({ step }) {
+  return (
+    <div style={{display:"flex", marginBottom:28}}>
+      {STEPS.map((s, i) => (
+        <div key={s} style={{flex:1, display:"flex", alignItems:"center"}}>
+          <div style={{width:26,height:26,borderRadius:"50%",background:i<=step?C.accent:C.border,color:i<=step?"#fff":C.muted,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:12,flexShrink:0}}>{i+1}</div>
+          <div style={{color:i<=step?C.text:C.muted, fontSize:12, marginLeft:6, fontWeight:i===step?700:400}}>{s}</div>
+          {i < STEPS.length-1 && <div style={{flex:1,height:2,background:i<step?C.accent:C.border,margin:"0 8px"}}/>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+
+function App() {
+  const [activeModule, setActiveModule] = useState("cheques"); // "cheques" | "f606"
+  const [step, setStep]               = useState(0);
+  const [xlsxFile, setXlsxFile]       = useState(null);
+  const [xlsxData, setXlsxData]       = useState(null);
+  const [templateInfo, setTemplateInfo]= useState(null);
+  const [chequeFile, setChequeFile]   = useState(null);
+  const [facturaFile, setFacturaFile] = useState(null);
+  const [loading, setLoading]         = useState(false);
+  const [loadingMsg, setLoadingMsg]   = useState("");
+  const [error, setError]             = useState(null);
+  const [editData, setEditData]       = useState(null);
+  const [resultBlob, setResultBlob]   = useState(null);
+  const [resultName, setResultName]   = useState("");
+  const [retenciones, setRetenciones] = useState({ aplicar_isr:true, aplicar_itbis:true, base_isr:"", base_itbis:"" });
+
+  // ── Estado módulo 606 ──────────────────────────────────────────────────────
+  const [f606Step, setF606Step]       = useState(0);
+  const [f606Pdf, setF606Pdf]         = useState(null);
+  const [f606Loading, setF606Loading] = useState(false);
+  const [f606LoadingMsg, setF606LoadingMsg] = useState("");
+  const [f606Error, setF606Error]     = useState(null);
+  const [f606Header, setF606Header]   = useState({ rnc:"", periodo:"" });
+  const [f606Rows, setF606Rows]       = useState([]);
+  const [f606ResultBlob, setF606ResultBlob] = useState(null);
+  const [f606ResultName, setF606ResultName] = useState("");
+
+  const F606_TIPOS_BIEN = [
+    ["01","Gastos de personal"],["02","Gastos por trabajo, suministros y servicios"],
+    ["03","Arrendamientos"],["04","Gastos de activos fijos"],["05","Gastos de representación"],
+    ["06","Otras deducciones admitidas"],["07","Gastos financieros"],["08","Gastos extraordinarios"],
+    ["09","Compras y gastos que forman parte del costo de venta"],["10","Adquisiciones de activos"],
+    ["11","Gastos de seguros"],["12","Otras compras de bienes y servicios"],
+  ];
+  const F606_TIPOS_ID = [["1","RNC"],["2","Cédula"],["3","Pasaporte"]];
+  const F606_FORMA_PAGO = [["01","Efectivo"],["02","Cheque/Transferencia/Depósito"],["03","Tarjeta Crédito/Débito"],["04","Compra a Crédito"],["05","Permuta"],["06","Nota de Crédito"],["07","Mixto"]];
+
+  function blankF606Row() {
+    return {
+      rnc_cedula:"", tipo_id:"1", tipo_bien_servicio:"02", ncf:"", ncf_modificado:"",
+      fecha_comprobante:"", fecha_pago:"", monto_servicios:"", monto_bienes:"",
+      monto_facturado_total:"", itbis_facturado:"", itbis_retenido:"",
+      itbis_sujeto_proporcionalidad:"", itbis_llevado_costo:"", itbis_por_adelantar:"",
+      itbis_percibido_compras:"", tipo_retencion_isr:"", monto_retencion_renta:"",
+      isr_percibido_compras:"", impuesto_selectivo_consumo:"", otros_impuestos_tasas:"",
+      monto_propina_legal:"", forma_pago:"02",
+    };
+  }
+
+
+  function calcRet(facData, ret) {
+    const subtotal    = parseMonto(facData?.subtotal);
+    const totalCuentas= (facData?.cuentas||[]).reduce((s,c) => s+parseMonto(c.monto), 0);
+    const base        = subtotal || totalCuentas;
+    const baseIsr     = parseFloat(ret.base_isr)   || base;
+    const baseItbis   = parseFloat(ret.base_itbis) || base;
+    const montoIsr    = ret.aplicar_isr   ? +(baseIsr*0.05).toFixed(2)   : 0;
+    const montoItbis  = ret.aplicar_itbis ? +(baseItbis*0.18).toFixed(2) : 0;
+    return { base, montoIsr, montoItbis, totalRet: montoIsr+montoItbis, neto: base-montoIsr-montoItbis };
+  }
+
+  // ── 606: Extraer todas las facturas del PDF mensual ─────────────────────────
+  async function f606Extract() {
+    if (!f606Pdf) return;
+    setF606Loading(true); setF606Error(null);
+    try {
+      setF606LoadingMsg("Leyendo PDF con todas las facturas…");
+      const b64 = await fileToBase64(f606Pdf);
+      const mt  = getMediaType(f606Pdf);
+      const blocks = [
+        mt==="application/pdf"
+          ? {type:"document", source:{type:"base64",media_type:mt,data:b64}}
+          : {type:"image",    source:{type:"base64",media_type:mt,data:b64}},
+        {type:"text", text:`Este archivo contiene VARIAS facturas de compra escaneadas, una tras otra (puede ser un PDF de varias páginas, una o más facturas por página).
+
+Identifica y separa CADA factura individual. Para cada una extrae los datos necesarios para el Formato 606 de la DGII (Compras de Bienes y Servicios).
+
+Responde SOLO JSON válido sin markdown, con este formato exacto:
+{"facturas":[
+  {
+    "rnc_cedula":"RNC o cédula del proveedor, solo números, sin guiones",
+    "tipo_id":"1 si es RNC, 2 si es cédula, 3 si es pasaporte",
+    "ncf":"número de comprobante fiscal completo (NCF o e-NCF)",
+    "ncf_modificado":"solo si es nota de crédito/débito que modifica otro NCF, sino vacío",
+    "fecha_comprobante":"fecha de la factura en formato AAAAMMDD",
+    "fecha_pago":"fecha de pago si se ve en el documento, formato AAAAMMDD, sino vacío",
+    "monto_servicios":"monto facturado por servicios (sin ITBIS), 0 si no aplica",
+    "monto_bienes":"monto facturado por bienes (sin ITBIS), 0 si no aplica",
+    "monto_facturado_total":"monto total facturado antes de ITBIS",
+    "itbis_facturado":"monto de ITBIS que aparece en la factura, 0 si es exenta",
+    "proveedor_nombre":"nombre o razón social del proveedor (solo referencia, no va al 606)",
+    "concepto":"breve descripción de qué se compró"
+  }
+]}
+
+Si una factura no tiene NCF visible o está borrosa, igual incluye lo que se pueda leer y deja vacío lo no legible. Cuenta cuántas facturas distintas hay — no mezcles dos facturas en una sola fila.`}
+      ];
+      setF606LoadingMsg("Identificando y separando facturas con IA…");
+      const system = `Eres un experto contable dominicano especializado en el Formato 606 de la DGII. Tu tarea es leer un documento con múltiples facturas escaneadas y extraer los datos de CADA UNA por separado con precisión. Responde ÚNICAMENTE JSON válido.`;
+      const raw  = await callClaude([{role:"user", content:blocks}], system);
+      const data = parseJSON(raw);
+      if (!data || !data.facturas) throw new Error("No se pudieron identificar facturas en el documento. Verifica que sea legible.");
+
+      const rows = data.facturas.map(f => {
+        const base = blankF606Row();
+        const itbisFact = parseMonto(f.itbis_facturado);
+        return {
+          ...base,
+          rnc_cedula: (f.rnc_cedula||"").replace(/[^0-9]/g,""),
+          tipo_id: f.tipo_id || "1",
+          ncf: f.ncf || "",
+          ncf_modificado: f.ncf_modificado || "",
+          fecha_comprobante: f.fecha_comprobante || "",
+          fecha_pago: f.fecha_pago || "",
+          monto_servicios: parseMonto(f.monto_servicios) || 0,
+          monto_bienes: parseMonto(f.monto_bienes) || 0,
+          monto_facturado_total: parseMonto(f.monto_facturado_total) || (parseMonto(f.monto_servicios)+parseMonto(f.monto_bienes)),
+          itbis_facturado: itbisFact,
+          itbis_llevado_costo: 0,
+          itbis_por_adelantar: itbisFact,
+          _proveedor: f.proveedor_nombre || "",
+          _concepto: f.concepto || "",
+        };
+      });
+      setF606Rows(rows);
+      setF606Step(1);
+    } catch(e) { setF606Error(e.message); }
+    setF606Loading(false);
+  }
+
+  // ── 606: Generar Excel con las 23 columnas oficiales ────────────────────────
+  function f606Generate() {
+    setF606Error(null);
+    if (!f606Header.rnc || !f606Header.periodo) { setF606Error("Completa el RNC y el período antes de generar."); return; }
+    if (f606Rows.length === 0) { setF606Error("No hay facturas para incluir."); return; }
+
+    const headers = [
+      "RNC o Cédula","Tipo Identificación","Tipo Bien o Servicio Comprado","NCF",
+      "NCF o Documento Modificado","Fecha del Comprobante","Fecha de Pago",
+      "Monto Facturado en Servicios","Monto Facturado en Bienes","Total Monto Facturado",
+      "ITBIS Facturado","ITBIS Retenido","ITBIS Sujeto a Proporcionalidad (Art. 349)",
+      "ITBIS llevado al Costo","ITBIS por Adelantar","ITBIS percibido en compras",
+      "Tipo de Retención en ISR","Monto Retención Renta","ISR Percibido en compras",
+      "Impuesto Selectivo al Consumo","Otros Impuestos/Tasas","Monto Propina Legal","Forma de Pago",
+    ];
+
+    const aoa = [headers];
+    f606Rows.forEach(r => {
+      aoa.push([
+        r.rnc_cedula, r.tipo_id, r.tipo_bien_servicio, r.ncf, r.ncf_modificado,
+        r.fecha_comprobante, r.fecha_pago,
+        Number(r.monto_servicios)||0, Number(r.monto_bienes)||0, Number(r.monto_facturado_total)||0,
+        Number(r.itbis_facturado)||0, Number(r.itbis_retenido)||0, Number(r.itbis_sujeto_proporcionalidad)||0,
+        Number(r.itbis_llevado_costo)||0, Number(r.itbis_por_adelantar)||0, Number(r.itbis_percibido_compras)||0,
+        r.tipo_retencion_isr, Number(r.monto_retencion_renta)||0, Number(r.isr_percibido_compras)||0,
+        Number(r.impuesto_selectivo_consumo)||0, Number(r.otros_impuestos_tasas)||0,
+        Number(r.monto_propina_legal)||0, r.forma_pago,
+      ]);
+    });
+
+    const wsDetalle = XLSX.utils.aoa_to_sheet(aoa);
+    const wsHeader  = XLSX.utils.aoa_to_sheet([
+      ["Formato 606 — Envío de Compras de Bienes y Servicios"],
+      ["RNC o Cédula del Informante", f606Header.rnc],
+      ["Período (AAAAMM)", f606Header.periodo],
+      ["Cantidad de Registros", f606Rows.length],
+    ]);
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, wsHeader, "Encabezado");
+    XLSX.utils.book_append_sheet(wb, wsDetalle, "Detalle 606");
+
+    const out  = XLSX.write(wb, { bookType:"xlsx", type:"array" });
+    const blob = new Blob([out], { type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const name = `606_${f606Header.rnc}_${f606Header.periodo}.xlsx`;
+    setF606ResultBlob(blob); setF606ResultName(name);
+    setF606Step(2);
+  }
+
+  function f606Download() {
+    const url = URL.createObjectURL(f606ResultBlob);
+    const a = document.createElement("a"); a.href=url; a.download=f606ResultName; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function f606Reset() {
+    setF606Step(0); setF606Pdf(null); setF606Rows([]); setF606Error(null);
+    setF606ResultBlob(null); setF606ResultName("");
+  }
+
+  function f606UpdRow(i, key, val) {
+    setF606Rows(rows => { const arr=[...rows]; arr[i] = {...arr[i], [key]: val}; return arr; });
+  }
+  function f606DelRow(i) {
+    setF606Rows(rows => rows.filter((_,j) => j!==i));
+  }
+  function f606AddRow() {
+    setF606Rows(rows => [...rows, blankF606Row()]);
+  }
+
+  const f606Totals = () => f606Rows.reduce((acc, r) => ({
+    facturado: acc.facturado + (Number(r.monto_facturado_total)||0),
+    itbis: acc.itbis + (Number(r.itbis_facturado)||0),
+    retencion: acc.retencion + (Number(r.monto_retencion_renta)||0),
+  }), { facturado:0, itbis:0, retencion:0 });
+
+  // ── Step 0 ────────────────────────────────────────────────────────────────
+  async function analyzeTemplate() {
+    if (!xlsxFile) return;
+    setLoading(true); setError(null); setLoadingMsg("Analizando estructura de la plantilla…");
+    try {
+      const ab = await xlsxFile.arrayBuffer();
+      const wb = XLSX.read(ab, { type:"array" });
+      setXlsxData(wb);
+      let summary = "";
+      wb.SheetNames.forEach(name => {
+        const ws   = wb.Sheets[name];
+        const rows = XLSX.utils.sheet_to_json(ws, { header:1, defval:"" });
+        summary += `\n\n=== HOJA: ${name} ===\n`;
+        rows.slice(0,60).forEach((row, ri) => {
+          const line = row.map((c,ci) => `${XLSX.utils.encode_cell({r:ri,c:ci})}:${c}`).filter(x=>x.split(":")[1]).join(" | ");
+          if (line) summary += line+"\n";
+        });
+      });
+      const system = `Eres experto contable dominicano. Analiza esta plantilla Excel de cheques/facturas.
+Responde SOLO JSON válido sin markdown:
+{"sheets":[],"cheque_fields":{"numero":"celda","fecha":"celda","beneficiario":"celda","monto":"celda","banco":"celda","cuenta":"celda","concepto":"celda","factura_ref":"celda"},"cuentas_start_row":10,"cuentas_sheet":"hoja","col_codigo_cuenta":"A","col_nombre_cuenta":"B","col_monto_cuenta":"C","col_debe":null,"col_haber":null,"notas":"descripción"}
+Usa null si no encuentras un campo.`;
+      const raw  = await callClaude([{role:"user",content:`Plantilla:\n${summary}`}], system);
+      const info = parseJSON(raw);
+      if (!info) throw new Error("No se pudo interpretar la plantilla.");
+      setTemplateInfo(info);
+      setStep(1);
+    } catch(e) { setError(e.message); }
+    setLoading(false);
+  }
+
+  // ── Step 1 ────────────────────────────────────────────────────────────────
+  async function extractDocuments() {
+    if (!chequeFile && !facturaFile) return;
+    setLoading(true); setError(null);
+    try {
+      const blocks = [];
+      if (chequeFile) {
+        setLoadingMsg("Leyendo cheque…");
+        const b64 = await fileToBase64(chequeFile);
+        const mt  = getMediaType(chequeFile);
+        blocks.push(mt==="application/pdf"
+          ? {type:"document", source:{type:"base64",media_type:mt,data:b64}}
+          : {type:"image",    source:{type:"base64",media_type:mt,data:b64}});
+        blocks.push({type:"text", text:"DOCUMENTO 1: CHEQUE. Extrae todos los datos."});
+      }
+      if (facturaFile) {
+        setLoadingMsg("Leyendo factura…");
+        const b64 = await fileToBase64(facturaFile);
+        const mt  = getMediaType(facturaFile);
+        blocks.push(mt==="application/pdf"
+          ? {type:"document", source:{type:"base64",media_type:mt,data:b64}}
+          : {type:"image",    source:{type:"base64",media_type:mt,data:b64}});
+        blocks.push({type:"text", text:"DOCUMENTO 2: FACTURA. Extrae datos y desglose de cuentas/rubros."});
+      }
+      blocks.push({type:"text", text:`Responde SOLO JSON válido sin markdown:
+{"cheque":{"numero":"","fecha":"","beneficiario":"","monto_total":"","banco":"","cuenta_bancaria":"","concepto":"","numero_factura":""},"factura":{"numero":"","fecha":"","proveedor":"","ruc_rnc":"","subtotal":"","impuestos":"","total":"","cuentas":[{"codigo":"","descripcion":"","monto":""}]},"confianza":"alta|media|baja","notas":""}`});
+      setLoadingMsg("Procesando con IA…");
+      const system = `Eres experto en documentos financieros dominicanos. Extrae info visible con precisión. Campos no visibles déjalos vacíos. Responde ÚNICAMENTE JSON válido.`;
+      const raw  = await callClaude([{role:"user", content:blocks}], system);
+      const data = parseJSON(raw);
+      if (!data) throw new Error("No se pudo extraer la información. Verifica que los archivos sean legibles.");
+      setEditData(JSON.parse(JSON.stringify(data)));
+      setStep(2);
+    } catch(e) { setError(e.message); }
+    setLoading(false);
+  }
+
+  // ── Step 2 ────────────────────────────────────────────────────────────────
+  async function applyToTemplate() {
+    if (!xlsxData || !templateInfo || !editData) return;
+    setLoading(true); setError(null); setLoadingMsg("Generando Excel…");
+    try {
+      const wb = XLSX.utils.book_new();
+      xlsxData.SheetNames.forEach(name => {
+        const orig = xlsxData.Sheets[name];
+        const ws   = {...orig};
+        if (orig["!ref"])    ws["!ref"]    = orig["!ref"];
+        if (orig["!merges"]) ws["!merges"] = orig["!merges"];
+        if (orig["!cols"])   ws["!cols"]   = orig["!cols"];
+        if (orig["!rows"])   ws["!rows"]   = orig["!rows"];
+        XLSX.utils.book_append_sheet(wb, ws, name);
+      });
+
+      const sheetName = templateInfo.cuentas_sheet || wb.SheetNames[0];
+      const ws = wb.Sheets[sheetName];
+      if (!ws) throw new Error(`Hoja no encontrada: ${sheetName}`);
+
+      const ch = editData.cheque  || {};
+      const fa = editData.factura || {};
+      const cf = templateInfo.cheque_fields || {};
+
+      const setCell = (addr, val) => {
+        if (!addr || addr==="null") return;
+        ws[addr] = { v:val, t:typeof val==="number"?"n":"s" };
+      };
+
+      if (cf.numero)       setCell(cf.numero,       ch.numero||"");
+      if (cf.fecha)        setCell(cf.fecha,         ch.fecha||"");
+      if (cf.beneficiario) setCell(cf.beneficiario,  ch.beneficiario||"");
+      if (cf.banco)        setCell(cf.banco,         ch.banco||"");
+      if (cf.cuenta)       setCell(cf.cuenta,        ch.cuenta_bancaria||"");
+      if (cf.concepto)     setCell(cf.concepto,      ch.concepto||"");
+      if (cf.factura_ref)  setCell(cf.factura_ref,   ch.numero_factura||fa.numero||"");
+
+      const cuentas  = fa.cuentas || [];
+      const startRow = templateInfo.cuentas_start_row || 10;
+      const colCod   = templateInfo.col_codigo_cuenta;
+      const colNom   = templateInfo.col_nombre_cuenta;
+      const colMon   = templateInfo.col_monto_cuenta;
+      const colDebe  = templateInfo.col_debe;
+      const colHabe  = templateInfo.col_haber;
+
+      cuentas.forEach((c, i) => {
+        const row = startRow+i;
+        const m   = parseMonto(c.monto);
+        if (colCod  && colCod!=="null")  setCell(`${colCod}${row}`,  c.codigo||"");
+        if (colNom  && colNom!=="null")  setCell(`${colNom}${row}`,  c.descripcion||"");
+        if (colMon  && colMon!=="null")  setCell(`${colMon}${row}`,  m);
+        if (colDebe && colDebe!=="null") setCell(`${colDebe}${row}`, m);
+        if (colHabe && colHabe!=="null") setCell(`${colHabe}${row}`, 0);
+      });
+
+      const ret = calcRet(fa, retenciones);
+      const rr  = startRow+cuentas.length+1;
+      const wRet = (row, label, monto) => {
+        if (colNom && colNom!=="null") ws[`${colNom}${row}`] = {v:label, t:"s"};
+        if (colMon && colMon!=="null") ws[`${colMon}${row}`] = {v:monto, t:"n"};
+        if (colHabe && colHabe!=="null") ws[`${colHabe}${row}`] = {v:monto, t:"n"};
+      };
+      wRet(rr,   "── Base Imponible",             ret.base);
+      if (retenciones.aplicar_isr)   wRet(rr+1, "Retención ISR 5% (Servicios)", -ret.montoIsr);
+      if (retenciones.aplicar_itbis) wRet(rr+2, "Retención ITBIS 18%",          -ret.montoItbis);
+      wRet(rr+3, "TOTAL RETENCIONES",            -ret.totalRet);
+      wRet(rr+4, "NETO A PAGAR",                  ret.neto);
+      if (cf.monto) setCell(cf.monto, ret.neto);
+
+      const range = XLSX.utils.decode_range(ws["!ref"] || "A1:Z100");
+      if (range.e.r < rr+5) { range.e.r = rr+6; ws["!ref"] = XLSX.utils.encode_range(range); }
+
+      const out  = XLSX.write(wb, { bookType:"xlsx", type:"array" });
+      const blob = new Blob([out], { type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      const name = `cheque_${ch.numero||"000"}_${(ch.fecha||"").replace(/\//g,"-")||new Date().toISOString().slice(0,10)}.xlsx`;
+      setResultBlob(blob); setResultName(name);
+      setStep(3);
+    } catch(e) { setError(e.message); }
+    setLoading(false);
+  }
+
+  function downloadResult() {
+    const url = URL.createObjectURL(resultBlob);
+    const a = document.createElement("a"); a.href=url; a.download=resultName; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function reset() {
+    setStep(0); setXlsxFile(null); setXlsxData(null); setTemplateInfo(null);
+    setChequeFile(null); setFacturaFile(null); setEditData(null);
+    setResultBlob(null); setResultName(""); setError(null);
+    setRetenciones({aplicar_isr:true, aplicar_itbis:true, base_isr:"", base_itbis:""});
+  }
+
+  // ── Styles ────────────────────────────────────────────────────────────────
+  const card = { background:C.card, border:`1px solid ${C.border}`, borderRadius:16, padding:24, marginBottom:20 };
+  const btn  = (primary=true, disabled=false) => ({
+    background: disabled?C.border:primary?C.accent:"transparent",
+    color: disabled?C.muted:primary?"#fff":C.accent,
+    border: primary?"none":`1px solid ${C.accent}`,
+    borderRadius:10, padding:"11px 24px", fontWeight:700, fontSize:14,
+    cursor:disabled?"not-allowed":"pointer", opacity:disabled?.6:1, transition:"all .2s",
+  });
+  const inp = { background:C.surface, border:`1px solid ${C.border}`, borderRadius:8, color:C.text, padding:"8px 12px", fontSize:13, width:"100%" };
+  const lbl = { color:C.muted, fontSize:12, marginBottom:4, display:"block" };
+
+  // ── Render ────────────────────────────────────────────────────────────────
+  return (
+    <div style={{minHeight:"100vh", background:C.bg, color:C.text, paddingBottom:60}}>
+
+      {/* Header */}
+      <div style={{background:"linear-gradient(135deg,#1a1d27,#21253a)", borderBottom:`1px solid ${C.border}`, padding:"18px 20px"}}>
+        <div style={{maxWidth:820, margin:"0 auto", display:"flex", alignItems:"center", gap:12}}>
+          <img src="data:image/png;base64,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" style={{width:42,height:42,borderRadius:10,objectFit:"cover"}} alt="SHADO"/>
+          <div>
+            <div style={{fontWeight:800, fontSize:18}}>SHADO <span style={{color:C.accent}}>Cheques & Facturas</span></div>
+            <div style={{color:C.muted, fontSize:11}}>Procesamiento inteligente de documentos → Excel · DGII RD</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Module Tabs */}
+      <div style={{maxWidth:820, margin:"0 auto", padding:"16px 16px 0", display:"flex", gap:10}}>
+        <button onClick={()=>setActiveModule("cheques")} style={{
+          flex:1, padding:"12px 16px", borderRadius:12, border:`1px solid ${activeModule==="cheques"?C.accent:C.border}`,
+          background:activeModule==="cheques"?`${C.accent}1a`:C.card, color:activeModule==="cheques"?C.text:C.muted,
+          fontWeight:700, fontSize:13, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:8,
+        }}>📋 Cheques & Facturas</button>
+        <button onClick={()=>setActiveModule("f606")} style={{
+          flex:1, padding:"12px 16px", borderRadius:12, border:`1px solid ${activeModule==="f606"?C.accent:C.border}`,
+          background:activeModule==="f606"?`${C.accent}1a`:C.card, color:activeModule==="f606"?C.text:C.muted,
+          fontWeight:700, fontSize:13, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:8,
+        }}>🏛️ Formato 606 DGII</button>
+      </div>
+
+      {activeModule==="cheques" && (
+      <div style={{maxWidth:820, margin:"0 auto", padding:"24px 16px 0"}}>
+        <StepBar step={step}/>
+
+        {error && (
+          <div style={{background:"#ef444422", border:`1px solid ${C.danger}`, borderRadius:10, padding:"12px 16px", marginBottom:20, color:C.danger, fontSize:13}}>
+            ⚠️ {error}
+          </div>
+        )}
+
+        {loading && <div style={card}><Spinner label={loadingMsg}/></div>}
+
+        {/* PASO 1 */}
+        {!loading && step===0 && (
+          <div style={card}>
+            <div style={{fontWeight:700, fontSize:15, marginBottom:6}}>Paso 1 — Sube tu plantilla Excel</div>
+            <div style={{color:C.muted, fontSize:13, marginBottom:20}}>La IA detecta automáticamente la estructura sin importar el formato.</div>
+            <UploadBox label="Seleccionar plantilla Excel" accept=".xlsx,.xls" file={xlsxFile} onChange={setXlsxFile} icon="📊" color={C.accent}/>
+            <div style={{marginTop:20, display:"flex", justifyContent:"flex-end"}}>
+              <button style={btn(true,!xlsxFile)} disabled={!xlsxFile} onClick={analyzeTemplate}>Analizar plantilla →</button>
+            </div>
+          </div>
+        )}
+
+        {!loading && step>=1 && templateInfo && (
+          <div style={{...card, background:"#22c55e11", border:`1px solid ${C.success}`, padding:"14px 20px"}}>
+            <div style={{display:"flex", justifyContent:"space-between", alignItems:"center"}}>
+              <div>
+                <div style={{fontWeight:700, color:C.success, fontSize:13}}>✅ Plantilla: {xlsxFile?.name}</div>
+                <div style={{color:C.muted, fontSize:12}}>{templateInfo.notas}</div>
+              </div>
+              {step<3 && <button style={{...btn(false), fontSize:11, padding:"5px 12px"}} onClick={()=>{setStep(0);setTemplateInfo(null);}}>Cambiar</button>}
+            </div>
+          </div>
+        )}
+
+        {/* PASO 2 */}
+        {!loading && step===1 && (
+          <div style={card}>
+            <div style={{fontWeight:700, fontSize:15, marginBottom:6}}>Paso 2 — Sube el cheque y/o la factura</div>
+            <div style={{color:C.muted, fontSize:13, marginBottom:20}}>Imagen escaneada (JPG, PNG) o PDF. Puedes subir uno o ambos.</div>
+            <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:14, marginBottom:20}}>
+              <UploadBox label="Cheque escaneado" accept="image/*,.pdf" file={chequeFile} onChange={setChequeFile} icon="🏦" color="#4f7cff"/>
+              <UploadBox label="Factura escaneada" accept="image/*,.pdf" file={facturaFile} onChange={setFacturaFile} icon="🧾" color="#f59e0b"/>
+            </div>
+            <div style={{display:"flex", justifyContent:"space-between"}}>
+              <button style={btn(false)} onClick={()=>setStep(0)}>← Atrás</button>
+              <button style={btn(true,!chequeFile&&!facturaFile)} disabled={!chequeFile&&!facturaFile} onClick={extractDocuments}>Extraer datos →</button>
+            </div>
+          </div>
+        )}
+
+        {/* PASO 3: Revisión */}
+        {!loading && step===2 && editData && (() => {
+          const updCheque = (k,v) => setEditData(d=>({...d,cheque:{...d.cheque,[k]:v}}));
+          const updFact   = (k,v) => setEditData(d=>({...d,factura:{...d.factura,[k]:v}}));
+          const updCuenta = (i,k,v) => { const arr=[...(editData.factura?.cuentas||[])]; arr[i]={...arr[i],[k]:v}; setEditData(d=>({...d,factura:{...d.factura,cuentas:arr}})); };
+          const addCuenta = () => { const arr=[...(editData.factura?.cuentas||[]),{codigo:"",descripcion:"",monto:""}]; setEditData(d=>({...d,factura:{...d.factura,cuentas:arr}})); };
+          const delCuenta = i => { const arr=(editData.factura?.cuentas||[]).filter((_,j)=>j!==i); setEditData(d=>({...d,factura:{...d.factura,cuentas:arr}})); };
+          const ret     = calcRet(editData.factura, retenciones);
+          const tog     = k => setRetenciones(r=>({...r,[k]:!r[k]}));
+          const togBtn  = active => ({width:40,height:22,borderRadius:11,background:active?C.accent:C.border,position:"relative",cursor:"pointer",border:"none",transition:"background .2s",flexShrink:0});
+          const knob    = active => ({position:"absolute",top:3,left:active?20:3,width:16,height:16,borderRadius:"50%",background:"#fff",transition:"left .2s"});
+
+          return (<>
+            {/* Cheque */}
+            <div style={card}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+                <div style={{fontWeight:700,fontSize:15}}>Datos del Cheque</div>
+                <span style={{background:`${editData.confianza==="alta"?C.success:C.warning}22`,color:editData.confianza==="alta"?C.success:C.warning,borderRadius:6,padding:"2px 10px",fontSize:11,fontWeight:600}}>
+                  Confianza: {editData.confianza||"media"}
+                </span>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                {[["Número","numero"],["Fecha","fecha"],["Beneficiario","beneficiario"],["Monto Total","monto_total"],
+                  ["Banco","banco"],["Cuenta Bancaria","cuenta_bancaria"],["Concepto","concepto"],["No. Factura","numero_factura"]
+                ].map(([l,k])=>(
+                  <div key={k}><label style={lbl}>{l}</label><input style={inp} value={editData.cheque?.[k]||""} onChange={e=>updCheque(k,e.target.value)}/></div>
+                ))}
+              </div>
+            </div>
+
+            {/* Factura cuentas */}
+            <div style={card}>
+              <div style={{fontWeight:700,fontSize:15,marginBottom:14}}>Factura — Desglose por Cuentas</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+                {[["No. Factura","numero"],["Fecha","fecha"],["Proveedor","proveedor"],["RNC/RUC","ruc_rnc"]].map(([l,k])=>(
+                  <div key={k}><label style={lbl}>{l}</label><input style={inp} value={editData.factura?.[k]||""} onChange={e=>updFact(k,e.target.value)}/></div>
+                ))}
+              </div>
+              <div style={{color:C.muted,fontSize:11,fontWeight:600,marginBottom:8}}>LÍNEAS DE CUENTAS / RUBROS</div>
+              <div style={{display:"grid",gridTemplateColumns:"110px 1fr 110px 32px",gap:6,marginBottom:4}}>
+                {["Código","Descripción / Rubro","Monto",""].map((h,i)=>(
+                  <div key={i} style={{color:C.muted,fontSize:11,fontWeight:600,paddingLeft:2}}>{h}</div>
+                ))}
+              </div>
+              {(editData.factura?.cuentas||[]).map((c,i)=>(
+                <div key={i} style={{display:"grid",gridTemplateColumns:"110px 1fr 110px 32px",gap:6,marginBottom:6,alignItems:"center"}}>
+                  <input placeholder="Código"       style={inp} value={c.codigo||""}      onChange={e=>updCuenta(i,"codigo",e.target.value)}/>
+                  <input placeholder="Descripción"  style={inp} value={c.descripcion||""} onChange={e=>updCuenta(i,"descripcion",e.target.value)}/>
+                  <input placeholder="Monto"        style={inp} value={c.monto||""}       onChange={e=>updCuenta(i,"monto",e.target.value)}/>
+                  <button onClick={()=>delCuenta(i)} style={{background:C.danger+"22",border:"none",borderRadius:6,color:C.danger,cursor:"pointer",height:34,fontSize:14}}>✕</button>
+                </div>
+              ))}
+              <button onClick={addCuenta} style={{...btn(false),fontSize:12,padding:"7px 14px",marginTop:6}}>+ Agregar cuenta</button>
+              <div style={{marginTop:14,padding:"12px 16px",background:C.highlight,borderRadius:10,display:"flex",justifyContent:"space-between"}}>
+                <span style={{fontWeight:600,fontSize:13}}>Total cuentas</span>
+                <span style={{fontWeight:800,color:C.accent}}>RD$ {fmt((editData.factura?.cuentas||[]).reduce((s,c)=>s+parseMonto(c.monto),0))}</span>
+              </div>
+            </div>
+
+            {/* Retenciones */}
+            <div style={card}>
+              <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
+                <div style={{fontSize:22}}>🏛️</div>
+                <div>
+                  <div style={{fontWeight:700,fontSize:15}}>Retenciones DGII</div>
+                  <div style={{color:C.muted,fontSize:11}}>República Dominicana · Normas vigentes</div>
+                </div>
+              </div>
+              <div style={{background:C.highlight,borderRadius:10,padding:"11px 14px",marginBottom:14,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{color:C.muted,fontSize:13}}>Base imponible</span>
+                <span style={{fontWeight:700}}>RD$ {fmt(ret.base)}</span>
+              </div>
+              {/* ISR */}
+              <div style={{border:`1px solid ${retenciones.aplicar_isr?C.accent:C.border}`,borderRadius:12,padding:"13px 14px",marginBottom:10,background:retenciones.aplicar_isr?`${C.accent}0d`:C.surface}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:retenciones.aplicar_isr?10:0}}>
+                  <div>
+                    <div style={{fontWeight:600,fontSize:13}}>Retención ISR — 5%</div>
+                    <div style={{color:C.muted,fontSize:11}}>Art. 309 Código Tributario · Servicios</div>
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
+                    {retenciones.aplicar_isr && <span style={{color:C.accent,fontWeight:700}}>− RD$ {fmt(ret.montoIsr)}</span>}
+                    <button style={togBtn(retenciones.aplicar_isr)} onClick={()=>tog("aplicar_isr")}><div style={knob(retenciones.aplicar_isr)}/></button>
+                  </div>
+                </div>
+                {retenciones.aplicar_isr && (
+                  <div><label style={lbl}>Base ISR (editable)</label>
+                  <input style={{...inp,maxWidth:180}} placeholder={`${fmt(ret.base)} (auto)`} value={retenciones.base_isr} onChange={e=>setRetenciones(r=>({...r,base_isr:e.target.value}))}/></div>
+                )}
+              </div>
+              {/* ITBIS */}
+              <div style={{border:`1px solid ${retenciones.aplicar_itbis?C.warning:C.border}`,borderRadius:12,padding:"13px 14px",marginBottom:14,background:retenciones.aplicar_itbis?"#f59e0b0d":C.surface}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:retenciones.aplicar_itbis?10:0}}>
+                  <div>
+                    <div style={{fontWeight:600,fontSize:13}}>Retención ITBIS — 18%</div>
+                    <div style={{color:C.muted,fontSize:11}}>Ley 253-12 · ITBIS facturado</div>
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
+                    {retenciones.aplicar_itbis && <span style={{color:C.warning,fontWeight:700}}>− RD$ {fmt(ret.montoItbis)}</span>}
+                    <button style={togBtn(retenciones.aplicar_itbis)} onClick={()=>tog("aplicar_itbis")}><div style={knob(retenciones.aplicar_itbis)}/></button>
+                  </div>
+                </div>
+                {retenciones.aplicar_itbis && (
+                  <div><label style={lbl}>Base ITBIS (editable)</label>
+                  <input style={{...inp,maxWidth:180}} placeholder={`${fmt(ret.base)} (auto)`} value={retenciones.base_itbis} onChange={e=>setRetenciones(r=>({...r,base_itbis:e.target.value}))}/></div>
+                )}
+              </div>
+              {/* Resumen */}
+              <div style={{borderTop:`1px solid ${C.border}`,paddingTop:12}}>
+                {[
+                  ["Subtotal factura", `RD$ ${fmt(ret.base)}`, null],
+                  retenciones.aplicar_isr   ? ["(−) Ret. ISR 5%",   `− RD$ ${fmt(ret.montoIsr)}`,   C.accent]  : null,
+                  retenciones.aplicar_itbis ? ["(−) Ret. ITBIS 18%",`− RD$ ${fmt(ret.montoItbis)}`, C.warning] : null,
+                ].filter(Boolean).map(([l,v,col],i)=>(
+                  <div key={i} style={{display:"flex",justifyContent:"space-between",marginBottom:6,fontSize:13}}>
+                    <span style={{color:C.muted}}>{l}</span><span style={{color:col||C.text}}>{v}</span>
+                  </div>
+                ))}
+                <div style={{display:"flex",justifyContent:"space-between",background:C.highlight,borderRadius:10,padding:"11px 14px",marginTop:6}}>
+                  <span style={{fontWeight:700,fontSize:14}}>💵 Neto a pagar</span>
+                  <span style={{fontWeight:800,fontSize:16,color:C.success}}>RD$ {fmt(ret.neto)}</span>
+                </div>
+              </div>
+            </div>
+
+            {editData.notas && (
+              <div style={{...card,background:"#f59e0b11",border:`1px solid ${C.warning}`,padding:"12px 16px"}}>
+                <div style={{color:C.warning,fontSize:13}}>📌 {editData.notas}</div>
+              </div>
+            )}
+
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:20}}>
+              <button style={btn(false)} onClick={()=>setStep(1)}>← Atrás</button>
+              <button style={btn()} onClick={applyToTemplate}>Aplicar a plantilla →</button>
+            </div>
+          </>);
+        })()}
+
+        {/* PASO 4: Exportar */}
+        {!loading && step===3 && (
+          <div style={card}>
+            <div style={{textAlign:"center",padding:"20px 0"}}>
+              <div style={{fontSize:52,marginBottom:12}}>🎉</div>
+              <div style={{fontWeight:800,fontSize:20,marginBottom:6}}>¡Plantilla completada!</div>
+              <div style={{color:C.muted,marginBottom:24,fontSize:13}}>{resultName}</div>
+              <div style={{display:"flex",gap:12,justifyContent:"center",flexWrap:"wrap",marginBottom:24}}>
+                <button style={{...btn(),background:"linear-gradient(135deg,#4f7cff,#7c3aed)",padding:"13px 30px",fontSize:15}} onClick={downloadResult}>
+                  ⬇️ Descargar Excel
+                </button>
+                <button style={btn(false)} onClick={reset}>Procesar otro cheque</button>
+              </div>
+              {(() => {
+                const ret = calcRet(editData?.factura, retenciones);
+                return (
+                  <div style={{background:C.highlight,borderRadius:12,padding:"16px 20px",textAlign:"left"}}>
+                    <div style={{color:C.muted,fontSize:11,fontWeight:600,marginBottom:10}}>RESUMEN APLICADO</div>
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,fontSize:13}}>
+                      <div><span style={{color:C.muted}}>Cheque No.:</span> <strong>{editData?.cheque?.numero}</strong></div>
+                      <div><span style={{color:C.muted}}>Fecha:</span> <strong>{editData?.cheque?.fecha}</strong></div>
+                      <div><span style={{color:C.muted}}>Beneficiario:</span> <strong>{editData?.cheque?.beneficiario}</strong></div>
+                      <div><span style={{color:C.muted}}>Factura:</span> <strong>{editData?.factura?.numero||editData?.cheque?.numero_factura}</strong></div>
+                      <div><span style={{color:C.muted}}>Subtotal:</span> <strong>RD$ {fmt(ret.base)}</strong></div>
+                      {retenciones.aplicar_isr && <div><span style={{color:C.muted}}>Ret. ISR 5%:</span> <strong style={{color:C.accent}}>− RD$ {fmt(ret.montoIsr)}</strong></div>}
+                      {retenciones.aplicar_itbis && <div><span style={{color:C.muted}}>Ret. ITBIS 18%:</span> <strong style={{color:C.warning}}>− RD$ {fmt(ret.montoItbis)}</strong></div>}
+                      <div style={{gridColumn:"1/-1",background:"#0f1117",borderRadius:8,padding:"8px 12px",display:"flex",justifyContent:"space-between"}}>
+                        <span style={{color:C.muted}}>Neto pagado:</span>
+                        <strong style={{color:C.success,fontSize:15}}>RD$ {fmt(ret.neto)}</strong>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+        )}
+
+      </div>
+      )}
+
+      {activeModule==="f606" && (() => {
+        const totals = f606Totals();
+        return (
+        <div style={{maxWidth:1100, margin:"0 auto", padding:"24px 16px 0"}}>
+
+          {/* Mini step indicator for 606 */}
+          <div style={{display:"flex", marginBottom:24, gap:0}}>
+            {["Subir PDF","Revisar Facturas","Exportar"].map((s,i) => (
+              <div key={s} style={{flex:1, display:"flex", alignItems:"center"}}>
+                <div style={{width:26,height:26,borderRadius:"50%",background:i<=f606Step?C.accent:C.border,color:i<=f606Step?"#fff":C.muted,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:12,flexShrink:0}}>{i+1}</div>
+                <div style={{color:i<=f606Step?C.text:C.muted, fontSize:12, marginLeft:6, fontWeight:i===f606Step?700:400}}>{s}</div>
+                {i<2 && <div style={{flex:1,height:2,background:i<f606Step?C.accent:C.border,margin:"0 8px"}}/>}
+              </div>
+            ))}
+          </div>
+
+          {f606Error && (
+            <div style={{background:"#ef444422", border:`1px solid ${C.danger}`, borderRadius:10, padding:"12px 16px", marginBottom:20, color:C.danger, fontSize:13}}>
+              ⚠️ {f606Error}
+            </div>
+          )}
+
+          {f606Loading && <div style={card}><Spinner label={f606LoadingMsg}/></div>}
+
+          {/* PASO 1: Subir PDF mensual */}
+          {!f606Loading && f606Step===0 && (
+            <div style={card}>
+              <div style={{fontWeight:700, fontSize:15, marginBottom:6}}>Sube el PDF con todas las facturas del mes</div>
+              <div style={{color:C.muted, fontSize:13, marginBottom:20}}>
+                Un solo archivo (PDF o imagen) con todas las facturas de compra escaneadas del período. La IA identificará cada factura por separado y extraerá los datos para el Formato 606.
+              </div>
+              <UploadBox label="Subir PDF mensual de facturas" accept=".pdf,image/*" file={f606Pdf} onChange={setF606Pdf} icon="📑" color={C.accent}/>
+
+              <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:14, marginTop:20}}>
+                <div>
+                  <label style={lbl}>RNC de tu negocio</label>
+                  <input style={inp} placeholder="130000000" value={f606Header.rnc} onChange={e=>setF606Header(h=>({...h, rnc:e.target.value.replace(/[^0-9]/g,"")}))}/>
+                </div>
+                <div>
+                  <label style={lbl}>Período (AAAAMM)</label>
+                  <input style={inp} placeholder="202606" value={f606Header.periodo} onChange={e=>setF606Header(h=>({...h, periodo:e.target.value.replace(/[^0-9]/g,"")}))}/>
+                </div>
+              </div>
+
+              <div style={{marginTop:20, display:"flex", justifyContent:"flex-end"}}>
+                <button style={btn(true,!f606Pdf)} disabled={!f606Pdf} onClick={f606Extract}>Extraer facturas →</button>
+              </div>
+            </div>
+          )}
+
+          {/* PASO 2: Revisar tabla de facturas */}
+          {!f606Loading && f606Step===1 && (
+            <>
+              <div style={{...card, background:"#22c55e11", border:`1px solid ${C.success}`, padding:"14px 20px"}}>
+                <div style={{fontWeight:700, color:C.success, fontSize:13}}>✅ {f606Rows.length} factura(s) identificada(s)</div>
+                <div style={{color:C.muted, fontSize:12}}>Revisa y corrige los datos antes de generar el Excel. Todos los campos son editables.</div>
+              </div>
+
+              <div style={{...card, overflowX:"auto"}}>
+                <div style={{fontWeight:700, fontSize:15, marginBottom:14}}>Detalle de Compras — Formato 606</div>
+
+                <table style={{borderCollapse:"collapse", width:"100%", minWidth:1400, fontSize:12}}>
+                  <thead>
+                    <tr>
+                      {["RNC/Cédula","Tipo Id","Tipo Bien/Serv.","NCF","NCF Modif.","Fecha Comp.","Fecha Pago",
+                        "Mto. Servicios","Mto. Bienes","Total Facturado","ITBIS Fact.","ITBIS Retenido",
+                        "ITBIS Adelantar","Tipo Ret. ISR","Mto. Ret. Renta","Forma Pago","Proveedor",""].map(h => (
+                        <th key={h} style={{textAlign:"left", padding:"6px 8px", color:C.muted, fontWeight:600, borderBottom:`1px solid ${C.border}`, whiteSpace:"nowrap"}}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {f606Rows.map((r,i) => (
+                      <tr key={i} style={{borderBottom:`1px solid ${C.border}`}}>
+                        <td style={{padding:4}}><input style={{...inp, width:110, fontSize:12}} value={r.rnc_cedula} onChange={e=>f606UpdRow(i,"rnc_cedula",e.target.value.replace(/[^0-9]/g,""))}/></td>
+                        <td style={{padding:4}}>
+                          <select style={{...inp, width:64, fontSize:12}} value={r.tipo_id} onChange={e=>f606UpdRow(i,"tipo_id",e.target.value)}>
+                            {F606_TIPOS_ID.map(([v,l])=><option key={v} value={v}>{v}</option>)}
+                          </select>
+                        </td>
+                        <td style={{padding:4}}>
+                          <select style={{...inp, width:90, fontSize:12}} value={r.tipo_bien_servicio} onChange={e=>f606UpdRow(i,"tipo_bien_servicio",e.target.value)}>
+                            {F606_TIPOS_BIEN.map(([v,l])=><option key={v} value={v} title={l}>{v}</option>)}
+                          </select>
+                        </td>
+                        <td style={{padding:4}}><input style={{...inp, width:140, fontSize:12}} value={r.ncf} onChange={e=>f606UpdRow(i,"ncf",e.target.value)}/></td>
+                        <td style={{padding:4}}><input style={{...inp, width:110, fontSize:12}} value={r.ncf_modificado} onChange={e=>f606UpdRow(i,"ncf_modificado",e.target.value)}/></td>
+                        <td style={{padding:4}}><input style={{...inp, width:100, fontSize:12}} placeholder="AAAAMMDD" value={r.fecha_comprobante} onChange={e=>f606UpdRow(i,"fecha_comprobante",e.target.value.replace(/[^0-9]/g,""))}/></td>
+                        <td style={{padding:4}}><input style={{...inp, width:100, fontSize:12}} placeholder="AAAAMMDD" value={r.fecha_pago} onChange={e=>f606UpdRow(i,"fecha_pago",e.target.value.replace(/[^0-9]/g,""))}/></td>
+                        <td style={{padding:4}}><input style={{...inp, width:90, fontSize:12}} value={r.monto_servicios} onChange={e=>f606UpdRow(i,"monto_servicios",e.target.value)}/></td>
+                        <td style={{padding:4}}><input style={{...inp, width:90, fontSize:12}} value={r.monto_bienes} onChange={e=>f606UpdRow(i,"monto_bienes",e.target.value)}/></td>
+                        <td style={{padding:4}}><input style={{...inp, width:100, fontSize:12, fontWeight:700}} value={r.monto_facturado_total} onChange={e=>f606UpdRow(i,"monto_facturado_total",e.target.value)}/></td>
+                        <td style={{padding:4}}><input style={{...inp, width:90, fontSize:12}} value={r.itbis_facturado} onChange={e=>f606UpdRow(i,"itbis_facturado",e.target.value)}/></td>
+                        <td style={{padding:4}}><input style={{...inp, width:90, fontSize:12}} value={r.itbis_retenido} onChange={e=>f606UpdRow(i,"itbis_retenido",e.target.value)}/></td>
+                        <td style={{padding:4}}><input style={{...inp, width:90, fontSize:12}} value={r.itbis_por_adelantar} onChange={e=>f606UpdRow(i,"itbis_por_adelantar",e.target.value)}/></td>
+                        <td style={{padding:4}}><input style={{...inp, width:70, fontSize:12}} value={r.tipo_retencion_isr} onChange={e=>f606UpdRow(i,"tipo_retencion_isr",e.target.value)}/></td>
+                        <td style={{padding:4}}><input style={{...inp, width:90, fontSize:12}} value={r.monto_retencion_renta} onChange={e=>f606UpdRow(i,"monto_retencion_renta",e.target.value)}/></td>
+                        <td style={{padding:4}}>
+                          <select style={{...inp, width:64, fontSize:12}} value={r.forma_pago} onChange={e=>f606UpdRow(i,"forma_pago",e.target.value)}>
+                            {F606_FORMA_PAGO.map(([v,l])=><option key={v} value={v}>{v}</option>)}
+                          </select>
+                        </td>
+                        <td style={{padding:4, color:C.muted, maxWidth:140, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}} title={r._proveedor}>{r._proveedor}</td>
+                        <td style={{padding:4}}><button onClick={()=>f606DelRow(i)} style={{background:C.danger+"22",border:"none",borderRadius:6,color:C.danger,cursor:"pointer",height:30,width:30,fontSize:13}}>✕</button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+
+                <button onClick={f606AddRow} style={{...btn(false), fontSize:12, padding:"7px 14px", marginTop:14}}>+ Agregar factura manualmente</button>
+
+                <div style={{marginTop:18, display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:12}}>
+                  <div style={{background:C.highlight, borderRadius:10, padding:"12px 14px"}}>
+                    <div style={{color:C.muted, fontSize:11}}>Total Facturado</div>
+                    <div style={{fontWeight:800, fontSize:15}}>RD$ {fmt(totals.facturado)}</div>
+                  </div>
+                  <div style={{background:C.highlight, borderRadius:10, padding:"12px 14px"}}>
+                    <div style={{color:C.muted, fontSize:11}}>ITBIS Total</div>
+                    <div style={{fontWeight:800, fontSize:15, color:C.accent}}>RD$ {fmt(totals.itbis)}</div>
+                  </div>
+                  <div style={{background:C.highlight, borderRadius:10, padding:"12px 14px"}}>
+                    <div style={{color:C.muted, fontSize:11}}>Retención ISR Total</div>
+                    <div style={{fontWeight:800, fontSize:15, color:C.warning}}>RD$ {fmt(totals.retencion)}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{...card, padding:"16px 20px"}}>
+                <div style={{fontWeight:700, fontSize:14, marginBottom:12}}>Encabezado del Formato 606</div>
+                <div style={{display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:14}}>
+                  <div>
+                    <label style={lbl}>RNC de tu negocio</label>
+                    <input style={inp} value={f606Header.rnc} onChange={e=>setF606Header(h=>({...h, rnc:e.target.value.replace(/[^0-9]/g,"")}))}/>
+                  </div>
+                  <div>
+                    <label style={lbl}>Período (AAAAMM)</label>
+                    <input style={inp} value={f606Header.periodo} onChange={e=>setF606Header(h=>({...h, periodo:e.target.value.replace(/[^0-9]/g,"")}))}/>
+                  </div>
+                  <div>
+                    <label style={lbl}>Cantidad de Registros</label>
+                    <input style={{...inp, opacity:0.6}} value={f606Rows.length} disabled/>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{display:"flex", justifyContent:"space-between", marginBottom:20}}>
+                <button style={btn(false)} onClick={()=>setF606Step(0)}>← Atrás</button>
+                <button style={btn()} onClick={f606Generate}>Generar Excel 606 →</button>
+              </div>
+            </>
+          )}
+
+          {/* PASO 3: Exportar */}
+          {!f606Loading && f606Step===2 && (
+            <div style={card}>
+              <div style={{textAlign:"center", padding:"20px 0"}}>
+                <div style={{fontSize:52, marginBottom:12}}>🎉</div>
+                <div style={{fontWeight:800, fontSize:20, marginBottom:6}}>¡Formato 606 generado!</div>
+                <div style={{color:C.muted, marginBottom:6, fontSize:13}}>{f606ResultName}</div>
+                <div style={{color:C.muted, marginBottom:24, fontSize:12}}>{f606Rows.length} facturas · Período {f606Header.periodo}</div>
+
+                <div style={{display:"flex", gap:12, justifyContent:"center", flexWrap:"wrap", marginBottom:24}}>
+                  <button style={{...btn(), background:"linear-gradient(135deg,#4f7cff,#7c3aed)", padding:"13px 30px", fontSize:15}} onClick={f606Download}>
+                    ⬇️ Descargar Excel 606
+                  </button>
+                  <button style={btn(false)} onClick={f606Reset}>Procesar otro mes</button>
+                </div>
+
+                <div style={{background:C.highlight, borderRadius:12, padding:"16px 20px", textAlign:"left", fontSize:13}}>
+                  <div style={{color:C.muted, fontSize:11, fontWeight:600, marginBottom:10}}>⚠️ IMPORTANTE ANTES DE ENVIAR A LA DGII</div>
+                  <div style={{color:C.text, lineHeight:1.6}}>
+                    Este Excel contiene las 23 columnas del Formato 606 listas para revisión. Antes de remitirlo a la Oficina Virtual debes:
+                  </div>
+                  <ul style={{color:C.muted, marginTop:8, paddingLeft:18, lineHeight:1.8}}>
+                    <li>Verificar cada NCF y RNC contra la factura original</li>
+                    <li>Pasar los datos a la plantilla oficial de la DGII (con macros) para generar el .TXT</li>
+                    <li>Correr la Herramienta de Pre-Validación de la DGII antes de remitir</li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+          )}
+
+        </div>
+        );
+      })()}
+
+    </div>
+  );
+}
+
+ReactDOM.render(<App/>, document.getElementById("root"));
+</script>
+</body>
+</html>
